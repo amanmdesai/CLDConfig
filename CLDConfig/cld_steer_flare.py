@@ -16,11 +16,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# FLARE variant: event count read from the input file.
 import os
+import sys
 
 from DDSim.DD4hepSimulation import DD4hepSimulation
 from g4units import mm, GeV, MeV, m, deg
 SIM = DD4hepSimulation()
+
+
+def _cli_value(flag_names, argv):
+    for i, token in enumerate(argv):
+        if token in flag_names and i + 1 < len(argv):
+            return argv[i + 1]
+        for flag in flag_names:
+            if token.startswith(flag + "="):
+                return token.split("=", 1)[1]
+    return None
+
+
+_input_file = _cli_value(("--inputFiles", "-I"), sys.argv)
+if _input_file:
+    import ROOT
+    _events_file = ROOT.TFile.Open(_input_file)
+    _events_tree = _events_file.Get("events")
+    if _events_tree:
+        SIM.numberOfEvents = _events_tree.GetEntries()
+    _events_file.Close()
 
 ## The compact XML file
 SIM.compactFile = os.environ["K4GEO"]+"/FCCee/CLD/compact/CLD_o2_v07/CLD_o2_v07.xml"
@@ -35,7 +57,6 @@ SIM.inputFiles = []
 ## Macro file to execute for runType 'run' or 'vis'
 SIM.macroFile = ""
 ## number of events to simulate, used in batch mode
-SIM.numberOfEvents = 0
 ## Outputfile from the simulation
 SIM.outputFile = "CLD_SIM.edm4hep.root"
 ## Verbosity use integers from 1(most) to 7(least) verbose
