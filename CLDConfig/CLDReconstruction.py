@@ -16,42 +16,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# Copied from key4hep's CLDConfig CLDReconstruction.py, paired with ddsim_CLD.py and card_CLD_o2_v07.xml; FLARE never passes --num-events since -1 hangs this reader, so the event count is read from the input file below instead (previously hardcoded to the vendor default of 3).
 import os
 from Gaudi.Configuration import INFO, WARNING, DEBUG
 
-from Gaudi.Configurables import EventDataSvc, MarlinProcessorWrapper, GeoSvc, TrackingCellIDEncodingSvc
-from k4FWCore import ApplicationMgr, IOSvc
+from Configurables import k4DataSvc, MarlinProcessorWrapper
+from k4MarlinWrapper.inputReader import create_reader, attach_edm4hep2lcio_conversion
 from k4FWCore.parseArgs import parser
-import sys
-base_dir = os.path.dirname(__file__)
-sys.path.append(base_dir)
-from py_utils import SequenceLoader, parse_collection_patch_file
-from k4MarlinWrapper.io_helpers import IOHandlerHelper
-from Configurables import GeoSvc, TrackingCellIDEncodingSvc
+from py_utils import SequenceLoader, attach_lcio2edm4hep_conversion, create_writer, parse_collection_patch_file
 
 parser_group = parser.add_argument_group("CLDReconstruction.py custom options")
-# Need the dummy input such that the IOHandlerHelper.add_reader call below does not crash when called with --help
-parser_group.add_argument("--inputFiles", action="store", nargs="+", metavar=("file1", "file2"), help="One or multiple input files", default=["dummy_input.edm4hep.root"])
+parser_group.add_argument("--inputFiles", action="extend", nargs="+", metavar=("file1", "file2"), help="One or multiple input files")
 parser_group.add_argument("--outputBasename", help="Basename of the output file(s)", default="output")
 parser_group.add_argument("--trackingOnly", action="store_true", help="Run only track reconstruction", default=False)
 parser_group.add_argument("--enableLCFIJet", action="store_true", help="Enable LCFIPlus jet clustering parts", default=False)
 parser_group.add_argument("--cms", action="store", help="Choose a Centre-of-Mass energy", default=240, choices=(91, 160, 240, 365), type=int)
 parser_group.add_argument("--compactFile", help="Compact detector file to use", type=str, default=os.environ["K4GEO"] + "/FCCee/CLD/compact/CLD_o2_v07/CLD_o2_v07.xml")
-parser_group.add_argument("--native", action="store_true", help="Use the native EDM4hep tracking", default=False)
 tracking_group = parser_group.add_mutually_exclusive_group()
 tracking_group.add_argument("--conformalTracking", action="store_true", default=True, help="Use conformal tracking pattern recognition")
 tracking_group.add_argument("--truthTracking", action="store_true", default=False, help="Cheat tracking pattern recognition")
 reco_args = parser.parse_known_args()[0]
 
+_num_events = -1
+if reco_args.inputFiles:
+    import ROOT
+    _events_file = ROOT.TFile.Open(reco_args.inputFiles[0])
+    _events_tree = _events_file.Get("events")
+    if _events_tree:
+        _num_events = _events_tree.GetEntries()
+    _events_file.Close()
 
-evtsvc = EventDataSvc("EventDataSvc")
-iosvc = IOSvc()
-if reco_args.native:
-    iosvc.Input = reco_args.inputFiles
-    iosvc.Output = f"{reco_args.outputBasename}_REC.edm4hep.root"
-
-svcList = [evtsvc, iosvc]
 algList = []
+svcList = []
+
+evtsvc = k4DataSvc("EventDataSvc")
+svcList.append(evtsvc)
 
 CONFIG = {
              "CalorimeterIntegrationTimeWindow": "10ns",
@@ -64,20 +63,20 @@ CONFIG = {
              "OutputModeChoices": ["LCIO", "EDM4hep"] #, "both"] FIXME: both is not implemented yet
 }
 
-REC_COLLECTION_CONTENTS_FILE = f"{base_dir}/collections_rec_level.txt" # file with the collections to be patched in when writing from LCIO to EDM4hep
+REC_COLLECTION_CONTENTS_FILE = "collections_rec_level.txt" # file with the collections to be patched in when writing from LCIO to EDM4hep
 
+from Configurables import GeoSvc, TrackingCellIDEncodingSvc, Lcio2EDM4hepTool
 geoservice = GeoSvc("GeoSvc")
 geoservice.detectors = [reco_args.compactFile]
 geoservice.OutputLevel = INFO
 geoservice.EnableGeant4Geo = False
 svcList.append(geoservice)
 
-if not reco_args.native:
-    cellIDSvc = TrackingCellIDEncodingSvc("CellIDSvc")
-    cellIDSvc.EncodingStringParameterName = "GlobalTrackerReadoutID"
-    cellIDSvc.GeoSvcName = geoservice.name()
-    cellIDSvc.OutputLevel = INFO
-    svcList.append(cellIDSvc)
+cellIDSvc = TrackingCellIDEncodingSvc("CellIDSvc")
+cellIDSvc.EncodingStringParameterName = "GlobalTrackerReadoutID"
+cellIDSvc.GeoSvcName = geoservice.name()
+cellIDSvc.OutputLevel = INFO
+svcList.append(cellIDSvc)
 
 if len(geoservice.detectors) > 1:
     # we are making assumptions for reconstruction parameters based on the detector option, so we limit the possibilities
@@ -97,32 +96,35 @@ sequenceLoader = SequenceLoader(
     global_vars={"CONFIG": CONFIG, "geoservice": geoservice, "reco_args": reco_args,
                  "BEAM_SPOT_SIZES": BEAM_SPOT_SIZES,
                  },
-    base_dir=base_dir,
 )
 
-if not reco_args.native:
-    io_handler = IOHandlerHelper(algList, iosvc)
-    io_handler.add_reader(reco_args.inputFiles)
+if reco_args.inputFiles:
+    read = create_reader(reco_args.inputFiles, evtsvc)
+    read.OutputLevel = INFO
+    algList.append(read)
+else:
+    print('WARNING: No input files specified, the CLD Reconstruction will fail')
+    read = None
 
-    MyAIDAProcessor = MarlinProcessorWrapper("MyAIDAProcessor")
-    MyAIDAProcessor.OutputLevel = WARNING
-    MyAIDAProcessor.ProcessorType = "AIDAProcessor"
-    MyAIDAProcessor.Parameters = {
-                                  "Compress": ["1"],
-                                  "FileName": [f"{reco_args.outputBasename}_aida"],
-                                  "FileType": ["root"]
-                                  }
-
-    EventNumber = MarlinProcessorWrapper("EventNumber")
-    EventNumber.OutputLevel = WARNING
-    EventNumber.ProcessorType = "Statusmonitor"
-    EventNumber.Parameters = {
-                              "HowOften": ["1"]
+MyAIDAProcessor = MarlinProcessorWrapper("MyAIDAProcessor")
+MyAIDAProcessor.OutputLevel = WARNING
+MyAIDAProcessor.ProcessorType = "AIDAProcessor"
+MyAIDAProcessor.Parameters = {
+                              "Compress": ["1"],
+                              "FileName": [f"{reco_args.outputBasename}_aida"],
+                              "FileType": ["root"]
                               }
 
-    # setup AIDA histogramming and add eventual background overlay
-    algList.append(MyAIDAProcessor)
-    sequenceLoader.load("Overlay/Overlay")
+EventNumber = MarlinProcessorWrapper("EventNumber")
+EventNumber.OutputLevel = WARNING
+EventNumber.ProcessorType = "Statusmonitor"
+EventNumber.Parameters = {
+                          "HowOften": ["1"]
+                          }
+
+# setup AIDA histogramming and add eventual background overlay
+algList.append(MyAIDAProcessor)
+sequenceLoader.load("Overlay/Overlay")
 # tracker hit digitisation
 sequenceLoader.load("Tracking/TrackingDigi")
 
@@ -141,17 +143,15 @@ if not reco_args.trackingOnly:
     sequenceLoader.load("ParticleFlow/Pandora")
     sequenceLoader.load("CaloDigi/LumiCal")
 # monitoring and Reco to MCTruth linking
-if not reco_args.native:
-    sequenceLoader.load("HighLevelReco/RecoMCTruthLink")
-    sequenceLoader.load("Diagnostics/Tracking")
+sequenceLoader.load("HighLevelReco/RecoMCTruthLink")
+sequenceLoader.load("Diagnostics/Tracking")
 # pfo selector (might need re-optimisation)
-if not reco_args.trackingOnly and not reco_args.native:
+if not reco_args.trackingOnly:
     sequenceLoader.load("HighLevelReco/PFOSelector")
     sequenceLoader.load("HighLevelReco/JetClusteringOrRenaming")
     sequenceLoader.load("HighLevelReco/JetAndVertex")
 # event number processor, down here to attach the conversion back to edm4hep to it
-if not reco_args.native:
-    algList.append(EventNumber)
+algList.append(EventNumber)
 
 DST_KEEPLIST = ["MCParticlesSkimmed", "MCPhysicsParticles", "RecoMCTruthLink", "SiTracks", "SiTracks_Refitted", "PandoraClusters", "PandoraPFOs", "SelectedPandoraPFOs", "LooseSelectedPandoraPFOs", "TightSelectedPandoraPFOs", "RefinedVertexJets", "RefinedVertexJets_rel", "RefinedVertexJets_vtx", "RefinedVertexJets_vtx_RP", "BuildUpVertices", "BuildUpVertices_res", "BuildUpVertices_RP", "BuildUpVertices_res_RP", "BuildUpVertices_V0", "BuildUpVertices_V0_res", "BuildUpVertices_V0_RP", "BuildUpVertices_V0_res_RP", "PrimaryVertices", "PrimaryVertices_res", "PrimaryVertices_RP", "PrimaryVertices_res_RP", "RefinedVertices", "RefinedVertices_RP"]
 
@@ -159,26 +159,13 @@ DST_SUBSETLIST = ["EfficientMCParticles", "InefficientMCParticles", "MCPhysicsPa
 
 # TODO: replace all the ugly strings by something sensible like Enum
 if CONFIG["OutputMode"] == "LCIO":
-    if reco_args.native:
-        raise RuntimeError("LCIO output is not supported with --native")
-    Output_REC = io_handler.add_lcio_writer("Output_REC")
-    Output_REC.Parameters = {
-        "LCIOOutputFile": [f"{reco_args.outputBasename}_REC.slcio"],
-        "LCIOWriteMode": ["WRITE_NEW"],
-    }
+    Output_REC = create_writer("lcio", "Output_REC", f"{reco_args.outputBasename}_REC")
+    algList.append(Output_REC)
 
-    Output_DST = io_handler.add_lcio_writer("Output_DST")
-    dropped_types = ["MCParticle", "LCRelation", "SimCalorimeterHit", "CalorimeterHit", "SimTrackerHit", "TrackerHit", "TrackerHitPlane", "Track", "ReconstructedParticle", "LCFloatVec"]
-    Output_DST.Parameters = {
-        "LCIOOutputFile": [f"{reco_args.outputBasename}_DST.slcio"],
-        "LCIOWriteMode": ["WRITE_NEW"],
-        "DropCollectionNames": [],
-        "DropCollectionTypes": dropped_types,
-        "FullSubsetCollections": DST_SUBSETLIST,
-        "KeepCollectionNames": DST_KEEPLIST,
-    }
+    Output_DST = create_writer("lcio", "Output_DST", f"{reco_args.outputBasename}_DST", DST_KEEPLIST, DST_SUBSETLIST)
+    algList.append(Output_DST)
 
-if CONFIG["OutputMode"] == "EDM4Hep" and not reco_args.native:
+if CONFIG["OutputMode"] == "EDM4Hep":
     # Make sure that all collections are always available by patching in missing ones on-the-fly
     collPatcherRec = MarlinProcessorWrapper(
         "CollPatcherREC", OutputLevel=INFO, ProcessorType="PatchCollections"
@@ -188,18 +175,24 @@ if CONFIG["OutputMode"] == "EDM4Hep" and not reco_args.native:
     }
     algList.append(collPatcherRec)
 
-    io_handler.add_edm4hep_writer(f"{reco_args.outputBasename}_REC.edm4hep.root", ["keep *"])
+    Output_REC = create_writer("edm4hep", "Output_REC", f"{reco_args.outputBasename}_REC")
+    algList.append(Output_REC)
+
     # FIXME: needs https://github.com/key4hep/k4FWCore/issues/226
-    # <DST output for edm4hep>
+    # Output_DST = create_writer("edm4hep", "Output_DST", f"{reco_args.outputBasename}_DST", DST_KEEPLIST)
+    # algList.append(Output_DST)
 
 
-# We need to attach all the necessary converters
-if not reco_args.native:
-    io_handler.finalize_converters()
+# We need to convert the inputs in case we have EDM4hep input
+attach_edm4hep2lcio_conversion(algList, read)
 
+# We need to convert the outputs in case we have EDM4hep output
+attach_lcio2edm4hep_conversion(algList)
+
+from Configurables import ApplicationMgr
 ApplicationMgr( TopAlg = algList,
                 EvtSel = 'NONE',
-                EvtMax = 3, # Overridden by the --num-events switch to k4run
+                EvtMax = _num_events,
                 ExtSvc = svcList,
                 OutputLevel=WARNING
               )
